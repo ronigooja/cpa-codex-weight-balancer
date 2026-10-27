@@ -1,0 +1,92 @@
+# Loads the linux/arm64, windows/amd64 and darwin/amd64 libraries of a release
+# on native runners. scripts/dist.sh builds them, but neither the build machine
+# nor the Mac can run the first two, and the Mac loads darwin/amd64 only under
+# Rosetta. Run it on the draft before publishing.
+name: verify-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, e.g. v0.7.1
+        required: true
+
+# Only users with push access can see a draft release.
+permissions:
+  contents: write
+
+jobs:
+  loadcheck:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: ubuntu-24.04-arm, platform: linux_arm64, ext: so }
+          - { runner: windows-2025, platform: windows_amd64, ext: dll }
+    runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Test the loader
+        run: go test -count=1 ./tools/loadcheck/
+      # The token stays in this step: loadcheck runs code from the module graph.
+      - name: Download
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets \
+            --pattern "*_${{ matrix.platform }}.zip" --pattern checksums.txt
+          cd assets
+          sha256sum --check --ignore-missing checksums.txt
+          unzip -q ./*_${{ matrix.platform }}.zip
+      - name: Load
+        env:
+          TAG: ${{ inputs.tag }}
+        run: go run ./tools/loadcheck -version "${TAG#v}" "assets/cpa-codex-weight-balancer.${{ matrix.ext }}"
+
+  # darwin/amd64 is built with a patched toolchain that keeps g in TLS slot 11;
+  # a stock build shares the host's slot and crashes CPA.
+  darwin-amd64:
+    runs-on: macos-15-intel
+    # A library dyld unmaps under its runtime can hang the host's exit.
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.tag }}
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: Download
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --dir assets \
+            --pattern "*_darwin_amd64.zip" --pattern checksums.txt
+          cd assets
+          grep '_darwin_amd64\.zip$' checksums.txt | shasum -a 256 -c -
+          unzip -q ./*_darwin_amd64.zip
+      - name: Check the TLS slot
+        run: |
+          otool -tv assets/cpa-codex-weight-balancer.dylib |
+            awk '/%gs:0x30/ { stock++ } /%gs:0x58/ { patched++ } END { print "0x58:", patched + 0, "0x30:", stock + 0; exit !(patched > 0 && !stock) }'
+      - name: Load
+        env:
+          TAG: ${{ inputs.tag }}
+        run: go run ./tools/loadcheck -version "${TAG#v}" assets/cpa-codex-weight-balancer.dylib
+      - name: Load in CPA
+        run: scripts/cpa-load-darwin-amd64.sh assets/cpa-codex-weight-balancer.dylib
